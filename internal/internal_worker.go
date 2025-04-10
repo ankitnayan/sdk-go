@@ -28,6 +28,7 @@ package internal
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -43,10 +44,13 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
+	"github.com/invopop/jsonschema"
 	"github.com/nexus-rpc/sdk-go/nexus"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
+	nexuspb "go.temporal.io/api/nexus/v1"
+	"go.temporal.io/api/operatorservice/v1"
 	"go.temporal.io/api/temporalproto"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/api/workflowservicemock/v1"
@@ -1173,8 +1177,60 @@ func (aw *AggregatedWorker) start() error {
 			return fmt.Errorf("failed to start a nexus worker: %w", err)
 		}
 	}
+
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		for {
+			select {
+			case <-aw.stopC:
+				return
+			case <-ticker.C:
+				aw.publishNexusServices()
+			}
+		}
+	}()
+
 	aw.logger.Info("Started Worker")
 	return nil
+}
+
+func (aw *AggregatedWorker) publishNexusServices() {
+	for _, service := range aw.registry.nexusServices {
+		ss := &nexuspb.NexusServiceSpec{
+			Name: service.Name,
+		}
+		ops := service.Operations()
+		ss.Operations = make([]*nexuspb.NexusOperationSpec, len(ops))
+		for i, op := range ops {
+			inputSchema := jsonschema.ReflectFromType(op.InputType())
+			inputSchemaBytes, err := json.Marshal(inputSchema)
+			if err != nil {
+				aw.logger.Error("Failed to generate input type JSON schema", "service", service.Name, "operation", op.Name(), "error", err)
+				continue
+			}
+			outputSchema := jsonschema.ReflectFromType(op.OutputType())
+			outputSchemaBytes, err := json.Marshal(outputSchema)
+			if err != nil {
+				aw.logger.Error("Failed to generate output output JSON schema", "service", service.Name, "operation", op.Name(), "error", err)
+				continue
+			}
+			ss.Operations[i] = &nexuspb.NexusOperationSpec{
+				Name:         op.Name(),
+				InputSchema:  inputSchemaBytes,
+				OutputSchema: outputSchemaBytes,
+			}
+		}
+		_, err := aw.client.OperatorService().AddOrRenewNexusService(
+			context.Background(),
+			&operatorservice.AddOrRenewNexusServiceRequest{
+				Namespace: aw.client.namespace,
+				Service:   ss,
+			},
+		)
+		if err != nil {
+			aw.logger.Error("Failed to publish Nexus service to server", "service", service.Name, "error", err)
+		}
+	}
 }
 
 func (aw *AggregatedWorker) assertNotStopped() {
